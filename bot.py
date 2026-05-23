@@ -43,7 +43,7 @@ SUPPORTED_COURIERS = [
     "jne", "jnt", "sicepat", "anteraja", "pos", "tiki",
     "lion", "ninja", "wahana", "idexpress", "sap", "gosend",
     "grab", "lalamove", "ncs", "rex", "rpx", "sentral",
-    "star", "jet", "pandu", "dse", "first", "indah"
+    "star", "jet", "pandu", "dse", "first", "indah", "spx", "shopee", "spe"
 ]
 
 
