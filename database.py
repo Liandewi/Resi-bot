@@ -1,114 +1,113 @@
 """
-Database - Mendukung PostgreSQL (Railway) dan SQLite (Termux/lokal).
-Otomatis mendeteksi mana yang digunakan berdasarkan DATABASE_URL.
+Database - PostgreSQL menggunakan pg8000 (pure Python, kompatibel Python 3.13)
+atau SQLite untuk lokal.
 """
 
 import os
 import json
 import logging
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# Deteksi otomatis: pakai PostgreSQL kalau ada DATABASE_URL, kalau tidak pakai SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 USE_POSTGRES = DATABASE_URL.startswith("postgres")
 
-
-# ============================================================
-# SETUP DATABASE
-# ============================================================
-
 if USE_POSTGRES:
-    import psycopg2
-    import psycopg2.extras
-    logger.info("✅ Menggunakan PostgreSQL (Railway)")
+    import pg8000.native
+    parsed = urlparse(DATABASE_URL.replace("postgres://", "postgresql://"))
+    PG_CONFIG = {
+        "host": parsed.hostname,
+        "port": parsed.port or 5432,
+        "database": parsed.path.lstrip("/"),
+        "user": parsed.username,
+        "password": parsed.password,
+        "ssl_context": True
+    }
+    logger.info("✅ Menggunakan PostgreSQL (pg8000)")
 else:
     import sqlite3
     DB_PATH = os.getenv("DB_PATH", "resi_tracker.db")
     logger.info(f"✅ Menggunakan SQLite: {DB_PATH}")
 
 
-def _get_conn():
-    """Ambil koneksi database."""
-    if USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
+def _get_pg():
+    return pg8000.native.Connection(**PG_CONFIG)
 
 
-def _create_tables():
-    """Buat tabel jika belum ada."""
-    if USE_POSTGRES:
-        sql = """
-            CREATE TABLE IF NOT EXISTS packages (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                resi TEXT NOT NULL,
-                courier TEXT NOT NULL,
-                label TEXT DEFAULT 'Paket',
-                last_status TEXT DEFAULT '',
-                history TEXT DEFAULT '[]',
-                is_delivered INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, resi)
-            )
-        """
-    else:
-        sql = """
-            CREATE TABLE IF NOT EXISTS packages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                resi TEXT NOT NULL,
-                courier TEXT NOT NULL,
-                label TEXT DEFAULT 'Paket',
-                last_status TEXT DEFAULT '',
-                history TEXT DEFAULT '[]',
-                is_delivered INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, resi)
-            )
-        """
-    with _get_conn() as conn:
-        if USE_POSTGRES:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-        else:
-            conn.execute(sql)
-        conn.commit()
-    logger.info("✅ Database siap.")
+def _get_sqlite():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+CREATE_TABLE_PG = """
+    CREATE TABLE IF NOT EXISTS packages (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        resi TEXT NOT NULL,
+        courier TEXT NOT NULL,
+        label TEXT DEFAULT 'Paket',
+        last_status TEXT DEFAULT '',
+        history TEXT DEFAULT '[]',
+        is_delivered INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, resi)
+    )
+"""
+
+CREATE_TABLE_SQLITE = """
+    CREATE TABLE IF NOT EXISTS packages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        resi TEXT NOT NULL,
+        courier TEXT NOT NULL,
+        label TEXT DEFAULT 'Paket',
+        last_status TEXT DEFAULT '',
+        history TEXT DEFAULT '[]',
+        is_delivered INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, resi)
+    )
+"""
 
 
 class Database:
     def __init__(self):
-        _create_tables()
+        if USE_POSTGRES:
+            conn = _get_pg()
+            conn.run(CREATE_TABLE_PG)
+            conn.close()
+        else:
+            conn = _get_sqlite()
+            conn.execute(CREATE_TABLE_SQLITE)
+            conn.commit()
+            conn.close()
+        logger.info("✅ Database siap.")
 
     def add_package(self, user_id, resi, courier, label, last_status, history):
         try:
             if USE_POSTGRES:
-                sql = """
+                conn = _get_pg()
+                conn.run("""
                     INSERT INTO packages (user_id, resi, courier, label, last_status, history)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES (:user_id, :resi, :courier, :label, :last_status, :history)
                     ON CONFLICT (user_id, resi) DO NOTHING
-                """
-                with _get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(sql, (user_id, resi.upper(), courier.lower(),
-                                         label, last_status, json.dumps(history)))
-                    conn.commit()
+                """, user_id=user_id, resi=resi.upper(), courier=courier.lower(),
+                    label=label, last_status=last_status, history=json.dumps(history))
+                conn.close()
             else:
-                sql = """
-                    INSERT INTO packages (user_id, resi, courier, label, last_status, history)
+                conn = _get_sqlite()
+                conn.execute("""
+                    INSERT OR IGNORE INTO packages
+                    (user_id, resi, courier, label, last_status, history)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """
-                with _get_conn() as conn:
-                    conn.execute(sql, (user_id, resi.upper(), courier.lower(),
-                                      label, last_status, json.dumps(history)))
-                    conn.commit()
+                """, (user_id, resi.upper(), courier.lower(), label,
+                      last_status, json.dumps(history)))
+                conn.commit()
+                conn.close()
             return True
         except Exception as e:
             logger.error(f"Error add_package: {e}")
@@ -117,61 +116,65 @@ class Database:
     def update_package(self, user_id, resi, last_status, history):
         try:
             if USE_POSTGRES:
-                sql = """
-                    UPDATE packages SET last_status=%s, history=%s, updated_at=CURRENT_TIMESTAMP
-                    WHERE user_id=%s AND resi=%s
-                """
-                with _get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(sql, (last_status, json.dumps(history),
-                                         user_id, resi.upper()))
-                    conn.commit()
+                conn = _get_pg()
+                conn.run("""
+                    UPDATE packages SET last_status=:status, history=:history,
+                    updated_at=CURRENT_TIMESTAMP
+                    WHERE user_id=:uid AND resi=:resi
+                """, status=last_status, history=json.dumps(history),
+                    uid=user_id, resi=resi.upper())
+                conn.close()
             else:
-                sql = """
-                    UPDATE packages SET last_status=?, history=?, updated_at=CURRENT_TIMESTAMP
+                conn = _get_sqlite()
+                conn.execute("""
+                    UPDATE packages SET last_status=?, history=?,
+                    updated_at=CURRENT_TIMESTAMP
                     WHERE user_id=? AND resi=?
-                """
-                with _get_conn() as conn:
-                    conn.execute(sql, (last_status, json.dumps(history),
-                                      user_id, resi.upper()))
-                    conn.commit()
+                """, (last_status, json.dumps(history), user_id, resi.upper()))
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.error(f"Error update_package: {e}")
 
     def mark_delivered(self, user_id, resi):
         try:
             if USE_POSTGRES:
-                sql = """UPDATE packages SET is_delivered=1, updated_at=CURRENT_TIMESTAMP
-                         WHERE user_id=%s AND resi=%s"""
-                with _get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(sql, (user_id, resi.upper()))
-                    conn.commit()
+                conn = _get_pg()
+                conn.run("""
+                    UPDATE packages SET is_delivered=1, updated_at=CURRENT_TIMESTAMP
+                    WHERE user_id=:uid AND resi=:resi
+                """, uid=user_id, resi=resi.upper())
+                conn.close()
             else:
-                sql = """UPDATE packages SET is_delivered=1, updated_at=CURRENT_TIMESTAMP
-                         WHERE user_id=? AND resi=?"""
-                with _get_conn() as conn:
-                    conn.execute(sql, (user_id, resi.upper()))
-                    conn.commit()
+                conn = _get_sqlite()
+                conn.execute("""
+                    UPDATE packages SET is_delivered=1, updated_at=CURRENT_TIMESTAMP
+                    WHERE user_id=? AND resi=?
+                """, (user_id, resi.upper()))
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.error(f"Error mark_delivered: {e}")
 
     def get_package(self, user_id, resi):
         try:
             if USE_POSTGRES:
-                sql = "SELECT * FROM packages WHERE user_id=%s AND resi=%s"
-                with _get_conn() as conn:
-                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                        cur.execute(sql, (user_id, resi.upper()))
-                        row = cur.fetchone()
-                if row:
-                    pkg = dict(row)
+                conn = _get_pg()
+                rows = conn.run("""
+                    SELECT * FROM packages WHERE user_id=:uid AND resi=:resi
+                """, uid=user_id, resi=resi.upper())
+                cols = [c["name"] for c in conn.columns]
+                conn.close()
+                if rows:
+                    pkg = dict(zip(cols, rows[0]))
                     pkg["history"] = json.loads(pkg.get("history", "[]"))
                     return pkg
             else:
-                sql = "SELECT * FROM packages WHERE user_id=? AND resi=?"
-                with _get_conn() as conn:
-                    row = conn.execute(sql, (user_id, resi.upper())).fetchone()
+                conn = _get_sqlite()
+                row = conn.execute("""
+                    SELECT * FROM packages WHERE user_id=? AND resi=?
+                """, (user_id, resi.upper())).fetchone()
+                conn.close()
                 if row:
                     pkg = dict(row)
                     pkg["history"] = json.loads(pkg.get("history", "[]"))
@@ -184,30 +187,36 @@ class Database:
     def get_user_packages(self, user_id, include_delivered=False):
         try:
             if USE_POSTGRES:
-                sql = "SELECT * FROM packages WHERE user_id=%s"
-                params = [user_id]
+                conn = _get_pg()
+                sql = "SELECT * FROM packages WHERE user_id=:uid"
+                params = {"uid": user_id}
                 if not include_delivered:
                     sql += " AND is_delivered=0"
                 sql += " ORDER BY updated_at DESC"
-                with _get_conn() as conn:
-                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                        cur.execute(sql, params)
-                        rows = cur.fetchall()
+                rows = conn.run(sql, **params)
+                cols = [c["name"] for c in conn.columns]
+                conn.close()
+                packages = []
+                for row in rows:
+                    pkg = dict(zip(cols, row))
+                    pkg["history"] = json.loads(pkg.get("history", "[]"))
+                    packages.append(pkg)
+                return packages
             else:
+                conn = _get_sqlite()
                 sql = "SELECT * FROM packages WHERE user_id=?"
                 params = [user_id]
                 if not include_delivered:
                     sql += " AND is_delivered=0"
                 sql += " ORDER BY updated_at DESC"
-                with _get_conn() as conn:
-                    rows = conn.execute(sql, params).fetchall()
-
-            packages = []
-            for row in rows:
-                pkg = dict(row)
-                pkg["history"] = json.loads(pkg.get("history", "[]"))
-                packages.append(pkg)
-            return packages
+                rows = conn.execute(sql, params).fetchall()
+                conn.close()
+                packages = []
+                for row in rows:
+                    pkg = dict(row)
+                    pkg["history"] = json.loads(pkg.get("history", "[]"))
+                    packages.append(pkg)
+                return packages
         except Exception as e:
             logger.error(f"Error get_user_packages: {e}")
             return []
@@ -215,22 +224,32 @@ class Database:
     def get_all_active_packages(self):
         try:
             if USE_POSTGRES:
-                sql = "SELECT * FROM packages WHERE is_delivered=0 ORDER BY updated_at ASC"
-                with _get_conn() as conn:
-                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                        cur.execute(sql)
-                        rows = cur.fetchall()
+                conn = _get_pg()
+                rows = conn.run("""
+                    SELECT * FROM packages WHERE is_delivered=0
+                    ORDER BY updated_at ASC
+                """)
+                cols = [c["name"] for c in conn.columns]
+                conn.close()
+                packages = []
+                for row in rows:
+                    pkg = dict(zip(cols, row))
+                    pkg["history"] = json.loads(pkg.get("history", "[]"))
+                    packages.append(pkg)
+                return packages
             else:
-                sql = "SELECT * FROM packages WHERE is_delivered=0 ORDER BY updated_at ASC"
-                with _get_conn() as conn:
-                    rows = conn.execute(sql).fetchall()
-
-            packages = []
-            for row in rows:
-                pkg = dict(row)
-                pkg["history"] = json.loads(pkg.get("history", "[]"))
-                packages.append(pkg)
-            return packages
+                conn = _get_sqlite()
+                rows = conn.execute("""
+                    SELECT * FROM packages WHERE is_delivered=0
+                    ORDER BY updated_at ASC
+                """).fetchall()
+                conn.close()
+                packages = []
+                for row in rows:
+                    pkg = dict(row)
+                    pkg["history"] = json.loads(pkg.get("history", "[]"))
+                    packages.append(pkg)
+                return packages
         except Exception as e:
             logger.error(f"Error get_all_active_packages: {e}")
             return []
@@ -238,19 +257,21 @@ class Database:
     def remove_package(self, user_id, resi):
         try:
             if USE_POSTGRES:
-                sql = "DELETE FROM packages WHERE user_id=%s AND resi=%s"
-                with _get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(sql, (user_id, resi.upper()))
-                        count = cur.rowcount
-                    conn.commit()
-                return count > 0
+                conn = _get_pg()
+                conn.run("""
+                    DELETE FROM packages WHERE user_id=:uid AND resi=:resi
+                """, uid=user_id, resi=resi.upper())
+                conn.close()
+                return True
             else:
-                sql = "DELETE FROM packages WHERE user_id=? AND resi=?"
-                with _get_conn() as conn:
-                    cursor = conn.execute(sql, (user_id, resi.upper()))
-                    conn.commit()
-                return cursor.rowcount > 0
+                conn = _get_sqlite()
+                cursor = conn.execute("""
+                    DELETE FROM packages WHERE user_id=? AND resi=?
+                """, (user_id, resi.upper()))
+                conn.commit()
+                count = cursor.rowcount
+                conn.close()
+                return count > 0
         except Exception as e:
             logger.error(f"Error remove_package: {e}")
             return False
@@ -258,19 +279,18 @@ class Database:
     def remove_all_packages(self, user_id):
         try:
             if USE_POSTGRES:
-                sql = "DELETE FROM packages WHERE user_id=%s"
-                with _get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(sql, (user_id,))
-                        count = cur.rowcount
-                    conn.commit()
-                return count
+                conn = _get_pg()
+                conn.run("DELETE FROM packages WHERE user_id=:uid", uid=user_id)
+                conn.close()
+                return 1
             else:
-                sql = "DELETE FROM packages WHERE user_id=?"
-                with _get_conn() as conn:
-                    cursor = conn.execute(sql, (user_id,))
-                    conn.commit()
-                return cursor.rowcount
+                conn = _get_sqlite()
+                cursor = conn.execute(
+                    "DELETE FROM packages WHERE user_id=?", (user_id,))
+                conn.commit()
+                count = cursor.rowcount
+                conn.close()
+                return count
         except Exception as e:
             logger.error(f"Error remove_all_packages: {e}")
             return 0
