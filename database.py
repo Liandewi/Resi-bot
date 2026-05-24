@@ -1,3 +1,4 @@
+
 """
 Database - PostgreSQL menggunakan pg8000 (pure Python, kompatibel Python 3.13)
 atau SQLite untuk lokal.
@@ -22,7 +23,7 @@ if USE_POSTGRES:
         "database": parsed.path.lstrip("/"),
         "user": parsed.username,
         "password": parsed.password,
-        "ssl_context": False
+        "ssl_context": None
     }
     logger.info("✅ Menggunakan PostgreSQL (pg8000)")
 else:
