@@ -22,7 +22,7 @@ if USE_POSTGRES:
         "database": parsed.path.lstrip("/"),
         "user": parsed.username,
         "password": parsed.password,
-        "ssl_context": True
+        "ssl_context": False
     }
     logger.info("✅ Menggunakan PostgreSQL (pg8000)")
 else:
